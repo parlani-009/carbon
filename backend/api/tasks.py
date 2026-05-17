@@ -29,6 +29,7 @@ def process_task(task_id):
 # Each task: fetches chat + messages, calls appropriate LLM, stores response
 # =============================================================================
 
+
 @shared_task
 def process_qna_task(chat_id, message_id, query):
     """
@@ -48,6 +49,7 @@ def process_qna_task(chat_id, message_id, query):
     """
     import django.db
     from .models import Chat, Message
+    from .prompts import build_chat_context, build_qna_prompt, QNA_SCHEMA
     from carbot.minmax import structured_llm
 
     # Step 1: Fetch all messages for this chat
@@ -55,51 +57,18 @@ def process_qna_task(chat_id, message_id, query):
     messages = Message.objects.filter(chat_id=chat_id).order_by('created_at').all()
 
     # Step 2: Build combined chat history for context
-    chat_context = ""
-    for msg in messages:
-        sender = "Customer" if msg.sender == Message.Sender.USER else "Assistant"
-        if isinstance(msg.content, dict):
-            text = msg.content.get('text', '')
-        else:
-            text = str(msg.content)
-        chat_context += f"{sender}: {text}\n"
-
-    # Step 3: Build the god car salesman prompt
-    prompt = f"""You are the world's most knowledgeable and honest car salesperson.
-You have been helping a customer in a conversation. Read the full chat history below
-and answer the customer's latest question honestly and with deep car expertise.
-
-Be specific, factual, and helpful. If you don't know something, say so instead of guessing.
-If the question is vague, ask a clarifying question.
-
---- CHAT HISTORY ---
-{chat_context}
---- END CHAT HISTORY ---
-
-CUSTOMER'S QUESTION: "{query}"
-
-Provide a clear, detailed, and honest answer:"""
+    chat_context = build_chat_context(messages)
 
     # Close DB connections before LLM call (fixes SIGSEGV on Celery fork)
     django.db.close_old_connections()
 
-    # Step 4: Call structured_llm
-    schema = {
-        "type": "object",
-        "properties": {
-            "answer": {
-                "type": "string",
-                "description": "The answer to the customer's question"
-            }
-        },
-        "required": ["answer"]
-    }
-
-    result = structured_llm (prompt=prompt, output_schema=schema)
+    # Step 3: Build prompt and call LLM
+    prompt = build_qna_prompt(chat_context, query)
+    result = structured_llm(prompt=prompt, output_schema=QNA_SCHEMA)
     print(result)
     answer = result.get('answer', 'Sorry, I could not generate an answer.')
 
-    # Step 5: Store the response as an assistant message
+    # Step 4: Store the response as an assistant message
     Message.objects.create(
         chat=chat_obj,
         sender=Message.Sender.ASSISTANT,
@@ -129,58 +98,25 @@ def process_comparison_task(chat_id, message_id, query):
     """
     import django.db
     from .models import Chat, Message, Car
+    from .prompts import (
+        build_chat_context,
+        build_car_extraction_prompt,
+        build_comparison_prompt,
+        build_car_details_str,
+        CAR_EXTRACTION_SCHEMA,
+        COMPARISON_SCHEMA,
+    )
     from carbot.minmax import structured_llm
 
     # Step 1: Fetch chat history for context
     chat_obj = Chat.objects.get(id=chat_id)
     messages = Message.objects.filter(chat_id=chat_id).order_by('created_at').all()
-
-    chat_context = ""
-    for msg in messages:
-        sender = "Customer" if msg.sender == Message.Sender.USER else "Assistant"
-        if isinstance(msg.content, dict):
-            text = msg.content.get('text', '')
-        else:
-            text = str(msg.content)
-        chat_context += f"{sender}: {text}\n"
+    chat_context = build_chat_context(messages)
 
     # Step 2: Use LLM to extract car names from query + chat history
-    extract_schema = {
-        "type": "object",
-        "properties": {
-            "cars": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "company": {"type": "string", "description": "Car company/brand (e.g., BMW, Toyota, Tesla)"},
-                        "name": {"type": "string", "description": "Car model name (e.g., Model 3, Civic, 911)"}
-                    },
-                    "required": ["company", "name"]
-                },
-                "description": "List of car names mentioned or implied in the query"
-            }
-        },
-        "required": ["cars"]
-    }
-
-    extract_prompt = f"""From the user's query and chat history, identify all cars being discussed or compared.
-Return each car as company + model name.
-
-Examples:
-- "Tesla Model 3 vs BMW i4" → [{{"company": "Tesla", "name": "Model 3"}}, {{"company": "BMW", "name": "i4"}}]
-- "Compare Honda Civic and Toyota Corolla" → [{{"company": "Honda", "name": "Civic"}}, {{"company": "Toyota", "name": "Corolla"}}]
-
---- CHAT HISTORY ---
-{chat_context}
---- END CHAT HISTORY ---
-
-USER QUERY: "{query}"
-
-Extract the cars:"""
-
     django.db.close_old_connections()
-    extracted = structured_llm(prompt=extract_prompt, output_schema=extract_schema)
+    extract_prompt = build_car_extraction_prompt(chat_context, query)
+    extracted = structured_llm(prompt=extract_prompt, output_schema=CAR_EXTRACTION_SCHEMA)
     cars_to_compare = extracted.get('cars', [])
 
     if not cars_to_compare:
@@ -214,60 +150,16 @@ Extract the cars:"""
         return {'chat_id': chat_id, 'status': 'insufficient_cars'}
 
     # Step 4: Build car details string for comparison prompt
-    car_details = []
-    for c in found_cars:
-        details = (
-            f"{c.company} {c.name}\n"
-            f"  Price: ${c.price or 'N/A'} | HP: {c.horsepower or 'N/A'} | Torque: {c.torque or 'N/A'} Nm\n"
-            f"  Top Speed: {c.total_speed or 'N/A'} km/h | 0-100: {c.acceleration or 'N/A'}s\n"
-            f"  Engine: {c.engine or 'N/A'} ({c.engine_capacity or 'N/A'} CC)\n"
-            f"  Fuel: {c.fuel_type or 'N/A'} | Seats: {c.seats or 'N/A'}"
-        )
-        car_details.append(details)
-
-    car_details_str = "\n\n".join(car_details)
+    car_details_str = build_car_details_str(found_cars)
 
     # Step 5: Use LLM to generate a comparison table
-    comparison_schema = {
-        "type": "object",
-        "properties": {
-            "summary": {"type": "string", "description": "Brief overall summary of the comparison"},
-            "categories": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "category": {"type": "string", "description": "Category name (e.g., Performance, Value, Features)"},
-                        "winner": {"type": "string", "description": "Which car wins this category"},
-                        "details": {"type": "string", "description": "Why this car wins"}
-                    },
-                    "required": ["category", "winner", "details"]
-                }
-            },
-            "verdict": {"type": "string", "description": "Overall recommendation and which car wins overall"}
-        },
-        "required": ["summary", "categories", "verdict"]
-    }
-
-    comparison_prompt = f"""Compare these cars side-by-side in a structured format.
-Be honest and objective. Mention strengths and weaknesses of each.
-
---- CARS TO COMPARE ---
-{car_details_str}
---- END CARS ---
-
---- USER QUERY ---
-{query}
---- END USER QUERY ---
-
-Provide a structured comparison:"""
-
     django.db.close_old_connections()
-    comparison = structured_llm(prompt=comparison_prompt, output_schema=comparison_schema)
+    comparison_prompt = build_comparison_prompt(car_details_str, query)
+    comparison = structured_llm(prompt=comparison_prompt, output_schema=COMPARISON_SCHEMA)
     print(comparison)
 
     # Step 6: Build readable comparison text for the user
-    lines = [f"# 🚗 Car Comparison\n"]
+    lines = ["# Car Comparison\n"]
     lines.append(f"## Summary\n{comparison.get('summary', '')}\n")
 
     categories = comparison.get('categories', [])
@@ -320,93 +212,30 @@ def process_retrieval_task(chat_id, message_id, query):
     """
     import django.db
     from .models import Chat, Message, Car
+    from .prompts import (
+        build_chat_context,
+        build_filter_prompt,
+        build_ranking_prompt,
+        build_car_list_str,
+        FILTER_SCHEMA,
+        RANKING_SCHEMA,
+    )
     from carbot.minmax import structured_llm
 
     # Step 1: Fetch chat history for context
     chat_obj = Chat.objects.get(id=chat_id)
     messages = Message.objects.filter(chat_id=chat_id).order_by('created_at').all()
-
-    chat_context = ""
-    for msg in messages:
-        sender = "Customer" if msg.sender == Message.Sender.USER else "Assistant"
-        if isinstance(msg.content, dict):
-            text = msg.content.get('text', '')
-        else:
-            text = str(msg.content)
-        chat_context += f"{sender}: {text}\n"
+    chat_context = build_chat_context(messages)
 
     # Step 2: Use LLM to extract filters from query + chat history
-    # Maps user preferences to Car model fields: price, seats, fuel_type, engine, etc.
-    filter_schema = {
-        "type": "object",
-        "properties": {
-            "price_min": {"type": "number", "description": "Minimum price in $"},
-            "price_max": {"type": "number", "description": "Maximum price in $"},
-            "seats_min": {"type": "integer", "description": "Minimum number of seats"},
-            "seats_max": {"type": "integer", "description": "Maximum number of seats"},
-            "fuel_type": {"type": "string", "description": "Preferred fuel type (petrol, diesel, electric, hybrid)"},
-            "body_type": {"type": "string", "description": "Preferred body type (SUV, sedan, hatchback, coupe, etc.)"},
-            "horsepower_min": {"type": "number", "description": "Minimum horsepower"},
-            "usage": {"type": "string", "description": "Intended use (city, highway, off-road, family, sports, etc.)"},
-            "is_vague": {"type": "boolean", "description": "True if the query is too vague to filter effectively"}
-        }
-    }
-
-    filter_prompt = f"""Analyze this car search query and the chat history.
-Extract concrete filters for searching a car database. If the query is too vague
-or lacks enough information to filter effectively, set is_vague to true.
-
-Car database fields available: company, name, engine, engine_capacity, horsepower,
-total_speed, acceleration, price, fuel_type, seats, torque.
-
---- CHAT HISTORY ---
-{chat_context}
---- END CHAT HISTORY ---
-
-USER QUERY: "{query}"
-
-Extract filters:"""
-
     django.db.close_old_connections()
-    filters = structured_llm(prompt=filter_prompt, output_schema=filter_schema)
+    filter_prompt = build_filter_prompt(chat_context, query)
+    filters = structured_llm(prompt=filter_prompt, output_schema=FILTER_SCHEMA)
 
     # Step 3: If vague, ask follow-up questions
     if filters.get('is_vague', True):
-        question_prompt = f"""The customer is looking for cars but their query is too vague to search effectively.
-Based on the chat history, ask 3-4 specific questions to narrow down their needs.
-Ask about: budget, usage, family size, preferred features, fuel preference, etc.
-
---- CHAT HISTORY ---
-{chat_context}
---- END CHAT HISTORY ---
-
-USER QUERY: "{query}"
-
-Ask clear, specific follow-up questions:"""
-
-        question_schema = {
-            "type": "object",
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of 3-4 follow-up questions"
-                }
-            },
-            "required": ["questions"]
-        }
-
-        result = structured_llm(prompt=question_prompt, output_schema=question_schema)
-        print(result)
-        questions = result.get('questions', [])
-
-        Message.objects.create(
-            chat=chat_obj,
-            sender=Message.Sender.ASSISTANT,
-            message_type=Message.MessageType.AGENT_QUESTION,
-            content={'text': '\n'.join(questions), 'type': 'follow_up_questions'}
-        )
-        return {'chat_id': chat_id, 'status': 'follow_up_questions_asked'}
+        process_guidance_task.delay(chat_id, message_id, query)
+        return {'chat_id': chat_id, 'status': 'delegated_to_guidance'}
 
     # Step 4: Build Django query from extracted filters
     cars = Car.objects.all()
@@ -445,52 +274,11 @@ Ask clear, specific follow-up questions:"""
         return {'chat_id': chat_id, 'status': 'no_results'}
 
     # Build car list string for LLM ranking
-    car_list_str = "\n".join([
-        f"- {c.company} {c.name} | Price: ${c.price or 'N/A'} | Seats: {c.seats or 'N/A'} | "
-        f"HP: {c.horsepower or 'N/A'} | Fuel: {c.fuel_type or 'N/A'} | "
-        f"Top Speed: {c.total_speed or 'N/A'} km/h | Acceleration: {c.acceleration or 'N/A'}s"
-        for c in all_cars
-    ])
-
-    ranking_prompt = f"""A customer is looking for cars. Based on their query and chat history,
-rank these cars from best match to least match. For each car, explain briefly why they'd want it.
-
-Return the top {min(10, len(all_cars))} cars with a short reason for each.
-
---- CHAT HISTORY ---
-{chat_context}
---- END CHAT HISTORY ---
-
---- USER QUERY ---
-{query}
---- END USER QUERY ---
-
---- CARS TO RANK ---
-{car_list_str}
---- END CARS ---
-
-Return your ranked list:"""
-
-    ranking_schema = {
-        "type": "object",
-        "properties": {
-            "recommendations": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "car": {"type": "string", "description": "Car name (company + name)"},
-                        "reason": {"type": "string", "description": "Why this car fits the customer's needs"}
-                    },
-                    "required": ["car", "reason"]
-                }
-            }
-        },
-        "required": ["recommendations"]
-    }
+    car_list_str = build_car_list_str(all_cars)
 
     django.db.close_old_connections()
-    ranked = structured_llm(prompt=ranking_prompt, output_schema=ranking_schema)
+    ranking_prompt = build_ranking_prompt(chat_context, query, car_list_str, len(all_cars))
+    ranked = structured_llm(prompt=ranking_prompt, output_schema=RANKING_SCHEMA)
     recommendations = ranked.get('recommendations', [])
 
     # Build response text
@@ -534,61 +322,18 @@ def process_guidance_task(chat_id, message_id, query):
     """
     import django.db
     from .models import Chat, Message
+    from .prompts import build_chat_context, build_guidance_prompt, GUIDANCE_SCHEMA
     from carbot.minmax import structured_llm
 
     # Step 1: Fetch full chat history
     chat_obj = Chat.objects.get(id=chat_id)
     messages = Message.objects.filter(chat_id=chat_id).order_by('created_at').all()
-
-    chat_context = ""
-    for msg in messages:
-        sender = "Customer" if msg.sender == Message.Sender.USER else "Assistant"
-        if isinstance(msg.content, dict):
-            text = msg.content.get('text', '')
-        else:
-            text = str(msg.content)
-        chat_context += f"{sender}: {text}\n"
+    chat_context = build_chat_context(messages)
 
     # Step 2: Use LLM to analyze chat and generate targeted follow-up questions
-    # Ask 1 good question to help narrow down the user's needs
-    guidance_schema = {
-        "type": "object",
-        "properties": {
-            "question": {
-                "type": "string",
-                "description": "One focused follow-up question to help narrow down the best car for this customer"
-            },
-            "what_we_know": {
-                "type": "string",
-                "description": "What we already know about the customer's preferences from the chat"
-            },
-            "what_we_need": {
-                "type": "string",
-                "description": "What key information is still missing to make a good recommendation"
-            }
-        },
-        "required": ["question", "what_we_know", "what_we_need"]
-    }
-
-    guidance_prompt = f"""You are a thoughtful car buying guide helping a confused customer.
-Analyze the chat history and the customer's current query. Determine what we already know
-about their preferences and what's still missing.
-
-Then ask ONE focused, specific question that will have the biggest impact on narrowing down
-the right car for them. Don't ask generic questions — make it specific to what they've shared.
-
-Be warm, friendly, and helpful. The question should feel like a natural next step in conversation.
-
---- CHAT HISTORY ---
-{chat_context}
---- END CHAT HISTORY ---
-
-CUSTOMER: "{query}"
-
-Analyze and ask your question:"""
-
     django.db.close_old_connections()
-    result = structured_llm(prompt=guidance_prompt, output_schema=guidance_schema)
+    guidance_prompt = build_guidance_prompt(chat_context, query)
+    result = structured_llm(prompt=guidance_prompt, output_schema=GUIDANCE_SCHEMA)
     print(result)
 
     question = result.get('question', "What kind of car are you looking for?")
@@ -597,7 +342,7 @@ Analyze and ask your question:"""
 
     # Step 3: Build friendly guidance response
     response_lines = []
-    response_lines.append(f"Great question! Let me help you think through this.\n")
+    response_lines.append("Great question! Let me help you think through this.\n")
 
     if what_we_know:
         response_lines.append(f"**What I know so far:** {what_we_know}")

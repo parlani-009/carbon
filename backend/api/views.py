@@ -48,83 +48,19 @@ def chat(request):
 
     # =========================================================================
     # LLM CALL: Classify which mode/task to use
-    # You are a GOD car salesperson. Analyze the customer's query and chat history
-    # to decide which of the 4 modes best serves their need.
     # =========================================================================
     from carbot.minmax import structured_llm
+    from .prompts import build_chat_context, build_classification_prompt, CLASSIFICATION_SCHEMA
 
-    classification_schema = {
-        "type": "object",
-        "properties": {
-            "selected_mode": {
-                "type": "string",
-                "enum": ["qna", "comparison", "retrieval", "guidance"],
-                "description": "The mode that best fits the customer's query"
-            },
-            "reasoning": {
-                "type": "string",
-                "description": "Why this mode was selected"
-            },
-            "confidence": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1,
-                "description": "Confidence score for this classification"
-            }
-        },
-        "required": ["selected_mode", "reasoning", "confidence"]
-    }
-
-    classification_prompt = f"""You are the world's best car salesperson with unmatched knowledge of all cars.
-You have a customer asking about cars. Your job is to classify their query into ONE of these 4 modes:
-
-1. **Q&A MODE** - Customer asks a specific question about cars, features, specs, or wants explanations.
-   Example: "What is the difference between BMW and Mercedes?", "How fast is a Porsche 911?"
-
-2. **COMPARISON MODE** - Customer wants to compare two or more cars side-by-side.
-   Example: "Compare Tesla Model 3 vs BMW i4", "Which is better: Honda Civic or Toyota Corolla?"
-
-3. **RETRIEVAL MODE** - Customer wants to find/recommend cars based on needs or preferences.
-   They may ask questions like "What SUV should I buy for a family of 4?"
-
-4. **GUIDANCE MODE** - Customer seems confused, overwhelmed, or doesn't know what they want.
-   They might say things like "I don't know what car to get", "I'm confused about my options",
-   or their query is vague and you'd need to ask follow-up questions to help them.
-
-Analyze this customer's query AND their chat history, then classify which mode applies.
-
-CUSTOMER QUERY: "{query}"
-
-Chat History (for context):"""
-
-    # Append chat history to prompt
     chat_history = Message.objects.filter(chat_id=chat_obj.id).order_by('created_at').all()
-    for msg in chat_history:
-        sender = "Customer" if msg.sender == "user" else "Assistant"
-        if isinstance(msg.content, dict):
-            text = msg.content.get('text', '')
-        else:
-            text = str(msg.content)
-        classification_prompt += f"\n{sender}: {text}"
-
-    classification_prompt += "\n\nReturn your classification in the specified JSON format."
+    chat_context = build_chat_context(chat_history)
+    classification_prompt = build_classification_prompt(query, chat_context)
 
     classified_mode = structured_llm(
         prompt=classification_prompt,
-        output_schema=classification_schema
+        output_schema=CLASSIFICATION_SCHEMA
     )
 
-    # Store the classified message
-    # classified_message = Message.objects.create(
-    #     chat=chat_obj,
-    #     sender=Message.Sender.ASSISTANT,
-    #     message_type=Message.MessageType.PLAIN_TEXT,
-    #     content={
-    #         'mode': 'classification',
-    #         'query': query,
-    #         'classified_mode': classified_mode  # Uncomment when LLM is implemented
-    #     }
-    # )
     print(classified_mode)
     # =========================================================================
     # DISPATCH TO APPROPRIATE CELERY TASK BASED ON LLM CLASSIFICATION
@@ -144,7 +80,6 @@ Chat History (for context):"""
     return JsonResponse({
         'chat_id': str(chat_obj.id),
         'message_id': str(user_message.id),
-        # 'classified_message_id': str(classified_message.id),
         'classification': {
             'selected_mode': selected_mode,
             'reasoning': classified_mode.get('reasoning'),
