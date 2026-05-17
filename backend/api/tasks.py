@@ -97,7 +97,7 @@ Provide a clear, detailed, and honest answer:"""
 
     result = structured_llm (prompt=prompt, output_schema=schema)
     print(result)
-    answer = result.get('text', 'Sorry, I could not generate an answer.')
+    answer = result.get('answer', 'Sorry, I could not generate an answer.')
 
     # Step 5: Store the response as an assistant message
     Message.objects.create(
