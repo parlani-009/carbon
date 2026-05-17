@@ -2,7 +2,7 @@ from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.http import require_http_methods
 from django.views.decorators.csrf import csrf_exempt
 from .models import Chat, Message
-from .sse import subscribe_to_chat
+from .sse import subscribe_to_chat, json_dumps
 import json
 
 from .tasks import process_task, process_qna_task, process_comparison_task, process_retrieval_task, process_guidance_task
@@ -153,7 +153,7 @@ def stream_messages(request):
         messages = list(chat_obj.messages.order_by('created_at').values(
             'id', 'sender', 'message_type', 'content', 'created_at'
         ))
-        yield f"data: {json.dumps({'type': 'init', 'messages': messages})}\n\n"
+        yield f"data: {json_dumps({'type': 'init', 'messages': messages})}\n\n"
 
         # Subscribe to Redis channel for new messages
         pubsub = subscribe_to_chat(chat_id)
@@ -161,7 +161,7 @@ def stream_messages(request):
             for message in pubsub.listen():
                 if message['type'] == 'message':
                     data = json.loads(message['data'])
-                    yield f"data: {json.dumps({'type': 'message', 'message': data})}\n\n"
+                    yield f"data: {json_dumps({'type': 'message', 'message': data})}\n\n"
         finally:
             pubsub.unsubscribe()
             pubsub.close()
