@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import './App.css'
 
+const WS_BASE = (import.meta.env.VITE_WS_URL || 'ws://localhost:8000').replace(/\/$/, '')
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api'
 
 function App() {
@@ -13,24 +14,28 @@ function App() {
   const [isAtBottom, setIsAtBottom] = useState(true)
   const messagesEndRef = useRef(null)
   const messagesContainerRef = useRef(null)
-  const esRef = useRef(null)
+  const wsRef = useRef(null)
 
   // Load chat list on mount
   useEffect(() => {
     fetchChats()
   }, [])
 
-  // SSE: subscribe to real-time messages when a chat is active
+  // WebSocket: subscribe to real-time messages when a chat is active
   useEffect(() => {
     if (!activeChatId) return
 
     // Close any existing connection
-    esRef.current?.close()
+    wsRef.current?.close()
 
-    const es = new EventSource(`${API_BASE}/chat/stream/?chat_id=${activeChatId}`)
-    esRef.current = es
+    const ws = new WebSocket(`${WS_BASE}/ws/chat/${activeChatId}/`)
+    wsRef.current = ws
 
-    es.onmessage = (e) => {
+    ws.onopen = () => {
+      console.log('WS connected')
+    }
+
+    ws.onmessage = (e) => {
       const data = JSON.parse(e.data)
       if (data.type === 'init') {
         setMessages(data.messages || [])
@@ -39,11 +44,15 @@ function App() {
       }
     }
 
-    es.onerror = (e) => {
-      console.error('SSE error:', e)
+    ws.onerror = (e) => {
+      console.error('WS error:', e)
     }
 
-    return () => es.close()
+    ws.onclose = () => {
+      console.log('WS disconnected')
+    }
+
+    return () => ws.close()
   }, [activeChatId])
 
   // Smart scroll: only auto-scroll if user is already at the bottom

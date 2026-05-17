@@ -168,14 +168,18 @@ def stream_messages(request):
             last_ts = time.time()
 
         while True:
-            time.sleep(0.4)
-            current_ts = get_stream_timestamp(chat_id)
-            if current_ts > last_ts:
-                last_ts = current_ts
-                new_messages = get_stream_messages(chat_id, after_id=last_id)
-                for msg in new_messages:
-                    last_id = str(msg.get('id'))
-                    yield f"data: {json_dumps({'type': 'message', 'message': msg})}\n\n"
+            try:
+                time.sleep(0.4)
+                current_ts = get_stream_timestamp(chat_id)
+                if current_ts > last_ts:
+                    last_ts = current_ts
+                    new_messages = get_stream_messages(chat_id, after_id=last_id)
+                    for msg in new_messages:
+                        last_id = str(msg.get('id'))
+                        yield f"data: {json_dumps({'type': 'message', 'message': msg})}\n\n"
+            except (IOError, OSError):
+                # Client disconnected — stop streaming gracefully
+                break
 
     response = StreamingHttpResponse(
         event_stream(),

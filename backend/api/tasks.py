@@ -1,4 +1,5 @@
 from celery import shared_task
+import asgiref.sync
 
 
 @shared_task
@@ -68,15 +69,16 @@ def process_qna_task(chat_id, message_id, query):
     print(result)
     answer = result.get('text',result.get('answer', 'Sorry, I could not generate an answer.'))
 
-    # Step 4: Store the response as an assistant message
-    from .sse import publish_message, serialize_message
+    # Step 4: Store the response as an assistant message and broadcast via Channels
+    from .consumers import broadcast_new_message
+    from .sse import serialize_message
     msg = Message.objects.create(
         chat=chat_obj,
         sender=Message.Sender.ASSISTANT,
         message_type=Message.MessageType.PLAIN_TEXT,
         content={'text': answer}
     )
-    publish_message(chat_id, serialize_message(msg))
+    asgiref.sync.async_to_async(broadcast_new_message)(chat_id, serialize_message(msg))
 
     return {'chat_id': chat_id, 'status': 'completed', 'answer': answer}
 
@@ -122,14 +124,15 @@ def process_comparison_task(chat_id, message_id, query):
     cars_to_compare = extracted.get('cars', [])
 
     if not cars_to_compare:
-        from .sse import publish_message, serialize_message
+        from .consumers import broadcast_new_message
+        from .sse import serialize_message
         msg = Message.objects.create(
             chat=chat_obj,
             sender=Message.Sender.ASSISTANT,
             message_type=Message.MessageType.COMPARISON,
             content={'text': "I couldn't identify specific cars to compare from your query. Could you name the cars you'd like to compare?", 'type': 'no_cars_found'}
         )
-        publish_message(chat_id, serialize_message(msg))
+        asgiref.sync.async_to_async(broadcast_new_message)(chat_id, serialize_message(msg))
         return {'chat_id': chat_id, 'status': 'no_cars_found'}
 
     # Step 3: Find matching cars in the DB
@@ -145,14 +148,15 @@ def process_comparison_task(chat_id, message_id, query):
             found_cars.append(car)
 
     if len(found_cars) < 2:
-        from .sse import publish_message, serialize_message
+        from .consumers import broadcast_new_message
+        from .sse import serialize_message
         msg = Message.objects.create(
             chat=chat_obj,
             sender=Message.Sender.ASSISTANT,
             message_type=Message.MessageType.COMPARISON,
             content={'text': f"I found only {len(found_cars)} of the {len(cars_to_compare)} cars you mentioned in my database. Could you check the car names?", 'type': 'insufficient_cars'}
         )
-        publish_message(chat_id, serialize_message(msg))
+        asgiref.sync.async_to_async(broadcast_new_message)(chat_id, serialize_message(msg))
         return {'chat_id': chat_id, 'status': 'insufficient_cars'}
 
     # Step 4: Build car details string for comparison prompt
@@ -182,7 +186,8 @@ def process_comparison_task(chat_id, message_id, query):
     comparison_text = "\n".join(lines)
 
     # Step 7: Store the comparison as a COMPARISON message
-    from .sse import publish_message, serialize_message
+    from .consumers import broadcast_new_message
+    from .sse import serialize_message
     msg = Message.objects.create(
         chat=chat_obj,
         sender=Message.Sender.ASSISTANT,
@@ -194,7 +199,7 @@ def process_comparison_task(chat_id, message_id, query):
             'raw_comparison': comparison
         }
     )
-    publish_message(chat_id, serialize_message(msg))
+    asgiref.sync.async_to_async(broadcast_new_message)(chat_id, serialize_message(msg))
 
     return {'chat_id': chat_id, 'status': 'completed', 'cars_compared': len(found_cars)}
 
@@ -273,14 +278,15 @@ def process_retrieval_task(chat_id, message_id, query):
     # Step 5: If more than 10 results, use LLM to rank top 10
     all_cars = list(cars[:20])  # fetch up to 20, let LLM pick top 10
     if not all_cars:
-        from .sse import publish_message, serialize_message
+        from .consumers import broadcast_new_message
+        from .sse import serialize_message
         msg = Message.objects.create(
             chat=chat_obj,
             sender=Message.Sender.ASSISTANT,
             message_type=Message.MessageType.AGENT_QUESTION,
             content={'text': "I couldn't find any cars matching your criteria. Could you relax some of your requirements?", 'type': 'no_results'}
         )
-        publish_message(chat_id, serialize_message(msg))
+        asgiref.sync.async_to_async(broadcast_new_message)(chat_id, serialize_message(msg))
         return {'chat_id': chat_id, 'status': 'no_results'}
 
     # Build car list string for LLM ranking
@@ -301,14 +307,15 @@ def process_retrieval_task(chat_id, message_id, query):
         result_text = "\n".join(lines)
 
     # Step 6: Store the recommendation response
-    from .sse import publish_message, serialize_message
+    from .consumers import broadcast_new_message
+    from .sse import serialize_message
     msg = Message.objects.create(
         chat=chat_obj,
         sender=Message.Sender.ASSISTANT,
         message_type=Message.MessageType.AGENT_QUESTION,
         content={'text': result_text, 'type': 'car_recommendations', 'filters_applied': filters}
     )
-    publish_message(chat_id, serialize_message(msg))
+    asgiref.sync.async_to_async(broadcast_new_message)(chat_id, serialize_message(msg))
 
     return {'chat_id': chat_id, 'status': 'completed', 'recommendations_count': len(recommendations)}
 
@@ -368,7 +375,8 @@ def process_guidance_task(chat_id, message_id, query):
     guidance_text = "\n".join(response_lines)
 
     # Step 4: Store the guidance response
-    from .sse import publish_message, serialize_message
+    from .consumers import broadcast_new_message
+    from .sse import serialize_message
     msg = Message.objects.create(
         chat=chat_obj,
         sender=Message.Sender.ASSISTANT,
@@ -381,6 +389,6 @@ def process_guidance_task(chat_id, message_id, query):
             'what_we_need': what_we_need
         }
     )
-    publish_message(chat_id, serialize_message(msg))
+    asgiref.sync.async_to_async(broadcast_new_message)(chat_id, serialize_message(msg))
 
     return {'chat_id': chat_id, 'status': 'completed', 'question': question}
