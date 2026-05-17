@@ -1,7 +1,8 @@
-from django.http import JsonResponse
+from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.http import require_http_methods
 from django.views.decorators.csrf import csrf_exempt
 from .models import Chat, Message
+from .sse import subscribe_to_chat
 import json
 
 from .tasks import process_task, process_qna_task, process_comparison_task, process_retrieval_task, process_guidance_task
@@ -130,3 +131,45 @@ def get_messages(_request):
         'id', 'sender', 'message_type', 'content', 'created_at'
     )
     return JsonResponse({'messages': list(messages)})
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def stream_messages(request):
+    """SSE endpoint: streams new messages for a chat in real-time."""
+    chat_id = request.GET.get('chat_id')
+    if not chat_id:
+        return JsonResponse({'error': 'chat_id is required'}, status=400)
+
+    try:
+        chat_obj = Chat.objects.get(id=chat_id)
+    except Chat.DoesNotExist:
+        return JsonResponse({'error': 'Chat not found'}, status=404)
+    except Exception:
+        return JsonResponse({'error': 'Invalid chat_id'}, status=400)
+
+    def event_stream():
+        # Send current messages as initial event
+        messages = list(chat_obj.messages.order_by('created_at').values(
+            'id', 'sender', 'message_type', 'content', 'created_at'
+        ))
+        yield f"data: {json.dumps({'type': 'init', 'messages': messages})}\n\n"
+
+        # Subscribe to Redis channel for new messages
+        pubsub = subscribe_to_chat(chat_id)
+        try:
+            for message in pubsub.listen():
+                if message['type'] == 'message':
+                    data = json.loads(message['data'])
+                    yield f"data: {json.dumps({'type': 'message', 'message': data})}\n\n"
+        finally:
+            pubsub.unsubscribe()
+            pubsub.close()
+
+    response = StreamingHttpResponse(
+        event_stream(),
+        content_type='text/event-stream'
+    )
+    response['Cache-Control'] = 'no-cache'
+    response['X-Accel-Buffering'] = 'no'
+    return response

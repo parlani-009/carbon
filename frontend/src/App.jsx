@@ -13,18 +13,37 @@ function App() {
   const [isAtBottom, setIsAtBottom] = useState(true)
   const messagesEndRef = useRef(null)
   const messagesContainerRef = useRef(null)
+  const esRef = useRef(null)
 
   // Load chat list on mount
   useEffect(() => {
     fetchChats()
   }, [])
 
-  // Poll for new messages when a chat is active
+  // SSE: subscribe to real-time messages when a chat is active
   useEffect(() => {
     if (!activeChatId) return
-    fetchMessages(activeChatId)
-    const interval = setInterval(() => fetchMessages(activeChatId), 2000)
-    return () => clearInterval(interval)
+
+    // Close any existing connection
+    esRef.current?.close()
+
+    const es = new EventSource(`${API_BASE}/chat/stream/?chat_id=${activeChatId}`)
+    esRef.current = es
+
+    es.onmessage = (e) => {
+      const data = JSON.parse(e.data)
+      if (data.type === 'init') {
+        setMessages(data.messages || [])
+      } else if (data.type === 'message') {
+        setMessages((prev) => [...prev, data.message])
+      }
+    }
+
+    es.onerror = (e) => {
+      console.error('SSE error:', e)
+    }
+
+    return () => es.close()
   }, [activeChatId])
 
   // Smart scroll: only auto-scroll if user is already at the bottom
@@ -49,16 +68,6 @@ function App() {
       setChats(data.chats || [])
     } catch (err) {
       console.error('Failed to load chats:', err)
-    }
-  }
-
-  async function fetchMessages(chatId) {
-    try {
-      const res = await fetch(`${API_BASE}/chat/messages/?chat_id=${chatId}`)
-      const data = await res.json()
-      if (data.messages) setMessages(data.messages)
-    } catch (err) {
-      console.error('Failed to load messages:', err)
     }
   }
 
@@ -88,7 +97,6 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: activeChatId, query })
       })
-      // Messages will be fetched via polling
     } catch (err) {
       console.error('Failed to send message:', err)
     } finally {
