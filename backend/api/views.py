@@ -2,8 +2,9 @@ from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.http import require_http_methods
 from django.views.decorators.csrf import csrf_exempt
 from .models import Chat, Message
-from .sse import subscribe_to_chat, json_dumps
+from .sse import get_stream_messages, get_stream_timestamp, json_dumps
 import json
+import time
 
 from .tasks import process_task, process_qna_task, process_comparison_task, process_retrieval_task, process_guidance_task
 
@@ -136,7 +137,7 @@ def get_messages(_request):
 @csrf_exempt
 @require_http_methods(["GET"])
 def stream_messages(request):
-    """SSE endpoint: streams new messages for a chat in real-time."""
+    """SSE endpoint: streams new messages for a chat in real-time using Redis polling."""
     chat_id = request.GET.get('chat_id')
     if not chat_id:
         return JsonResponse({'error': 'chat_id is required'}, status=400)
@@ -148,23 +149,33 @@ def stream_messages(request):
     except Exception:
         return JsonResponse({'error': 'Invalid chat_id'}, status=400)
 
+    # After this id are new messages the client doesn't have yet
+    last_id = request.GET.get('after_id')
+
     def event_stream():
-        # Send current messages as initial event
+        # Send current messages as initial event (from DB, since Redis stream only has new messages)
         messages = list(chat_obj.messages.order_by('created_at').values(
             'id', 'sender', 'message_type', 'content', 'created_at'
         ))
         yield f"data: {json_dumps({'type': 'init', 'messages': messages})}\n\n"
+        # Track the last message id we've sent so we don't re-send on reconnect
+        if messages:
+            last_id = str(messages[-1]['id'])
 
-        # Subscribe to Redis channel for new messages
-        pubsub = subscribe_to_chat(chat_id)
-        try:
-            for message in pubsub.listen():
-                if message['type'] == 'message':
-                    data = json.loads(message['data'])
-                    yield f"data: {json_dumps({'type': 'message', 'message': data})}\n\n"
-        finally:
-            pubsub.unsubscribe()
-            pubsub.close()
+        last_ts = get_stream_timestamp(chat_id) or 0.0
+        if last_ts == 0.0:
+            # No messages published yet — use DB timestamp as baseline
+            last_ts = time.time()
+
+        while True:
+            time.sleep(0.4)
+            current_ts = get_stream_timestamp(chat_id)
+            if current_ts > last_ts:
+                last_ts = current_ts
+                new_messages = get_stream_messages(chat_id, after_id=last_id)
+                for msg in new_messages:
+                    last_id = str(msg.get('id'))
+                    yield f"data: {json_dumps({'type': 'message', 'message': msg})}\n\n"
 
     response = StreamingHttpResponse(
         event_stream(),
