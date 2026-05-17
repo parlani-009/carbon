@@ -66,7 +66,7 @@ def process_qna_task(chat_id, message_id, query):
     prompt = build_qna_prompt(chat_context, query)
     result = structured_llm(prompt=prompt, output_schema=QNA_SCHEMA)
     print(result)
-    answer = result.get('answer', 'Sorry, I could not generate an answer.')
+    answer = result.get('text',result.get('answer', 'Sorry, I could not generate an answer.'))
 
     # Step 4: Store the response as an assistant message
     Message.objects.create(
